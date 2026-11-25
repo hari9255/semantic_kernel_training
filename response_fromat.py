@@ -1,57 +1,48 @@
 import asyncio
-from pydantic import BaseModel, ConfigDict, Field
-from semantic_kernel import Kernel
+from pydantic import BaseModel
+from anthropic import transform_schema   # turns a Pydantic class into a schema Claude accepts
 from semantic_kernel.agents import ChatCompletionAgent
 from semantic_kernel.connectors.ai.anthropic import (
     AnthropicChatCompletion,
     AnthropicChatPromptExecutionSettings,
 )
 from semantic_kernel.functions import KernelArguments
+import os
+os.environ["ANTHROPIC_API_KEY"] = ""
+from pypdf import PdfReader
 
-# 1. Define the desired output schema
-# Note: Anthropic structured outputs require extra="forbid" (additionalProperties: False)
+reader = PdfReader("invoice.pdf")
+pdf_text = "\n".join(page.extract_text() for page in reader.pages)
+
 class PurchaseOrderInfo(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    
-    customer_name: str = Field(description="Full name of the customer or company")
-    po_number: str = Field(description="Purchase Order (PO) number")
-    date: str = Field(description="Order date in YYYY-MM-DD format")
+    invoice_number: str
+    PO_number: str
+    total_amount: float
+
+
+# Add the field Semantic Kernel doesn't expose
+class AnthropicStructuredSettings(AnthropicChatPromptExecutionSettings):
+    output_config: dict | None = None
+
+
+settings = AnthropicStructuredSettings(
+    max_tokens=1024,
+    output_config={
+        "format": {"type": "json_schema", "schema": transform_schema(PurchaseOrderInfo)}
+    },
+)
+
+agent = ChatCompletionAgent(
+    service=AnthropicChatCompletion(ai_model_id="claude-haiku-4-5"),  # reads ANTHROPIC_API_KEY
+    name="POExtractor",
+    instructions="Extract purchase order details from the text.",
+    arguments=KernelArguments(settings=settings),
+)
+
 
 async def main():
-    kernel = Kernel()
-    
-    # 2. Add Anthropic Chat Completion service
-    service_id = "anthropic"
-    kernel.add_service(
-        AnthropicChatCompletion(
-            service_id=service_id,
-            ai_model_id="claude-sonnet-4-5",  # Ensure you use a Claude model supporting structured outputs
-        )
-    )
+    response = await agent.get_response(messages=pdf_text)
+    po = PurchaseOrderInfo.model_validate_json(str(response.content))
+    print(po)
 
-    # 3. Configure execution settings with response_format
-    settings = AnthropicChatPromptExecutionSettings(
-        service_id=service_id,
-        response_format=PurchaseOrderInfo,
-    )
-
-    # 4. Initialize the ChatCompletionAgent
-    agent = ChatCompletionAgent(
-        kernel=kernel,
-        name="POExtractorAgent",
-        instructions="Extract the customer name, PO number, and date from the user's message.",
-        arguments=KernelArguments(settings=settings),
-    )
-
-    # 5. Invoke the agent
-    user_input = "Hi, this is Acme Corp. Please process PO #98432 dated November 25, 2026."
-    response = await agent.get_response(messages=user_input)
-    
-    # Parse the guaranteed JSON response back into your Pydantic model
-    extracted_data = PurchaseOrderInfo.model_validate_json(str(response.content))
-    print(f"Customer: {extracted_data.customer_name}")
-    print(f"PO: {extracted_data.po_number}")
-    print(f"Date: {extracted_data.date}")
-
-if __name__ == "__main__":
-    asyncio.run(main())
+asyncio.run(main())
